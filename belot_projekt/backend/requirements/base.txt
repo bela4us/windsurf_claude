@@ -1,1 +1,44 @@
+# Base dependencies required for all environments
 
+# Django core
+Django==4.2.9
+djangorestframework==3.14.0
+djangorestframework-simplejwt==5.3.1
+django-cors-headers==4.3.1
+django-filter==23.5
+django-storages==1.14.2
+django-environ==0.11.2
+
+# Channels for WebSockets
+channels==4.0.0
+channels-redis==4.1.0
+daphne==4.0.0
+
+# Database
+psycopg2-binary==2.9.9
+redis==5.0.1
+
+# Caching and async tasks
+celery==5.3.6
+django-celery-beat==2.5.0
+django-celery-results==2.5.1
+
+# Utils
+Pillow==10.1.0  # For image processing
+pyjwt==2.8.0  # For JWT tokens
+python-dateutil==2.8.2
+pytz==2023.3.post1
+shortuuid==1.0.11  # For generating short unique IDs
+argon2-cffi==23.1.0  # For password hashing
+
+# Serialization
+pyyaml==6.0.1
+
+# Logging
+structlog==23.2.0
+python-json-logger==2.0.7
+
+# Validation
+jsonschema==4.20.0
+coreapi==2.3.3
+pyyaml==6.0.1

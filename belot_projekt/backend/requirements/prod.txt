@@ -1,1 +1,42 @@
+# Production dependencies
+-r base.txt
 
+# WSGI server
+gunicorn==21.2.0
+uvicorn[standard]==0.24.0.post1
+
+# Performance & monitoring
+sentry-sdk==1.39.1
+django-prometheus==2.3.1
+newrelic==9.4.0
+scout-apm==2.26.1
+
+# Security
+django-axes==6.1.1  # Login attempt limiting
+django-csp==3.7  # Content Security Policy
+django-permissions-policy==4.18.0
+django-stronghold==0.4.0
+
+# Production database
+psycopg2-binary==2.9.9  # Already in base, but included for explicitness
+
+# Storage
+django-storages[boto3]==1.14.2
+boto3==1.33.6
+
+# Caching
+django-redis==5.4.0
+
+# Performance optimizations
+django-cachalot==2.6.2
+whitenoise==6.6.0  # Static files serving
+
+# Email
+django-anymail[mailgun]==10.2
+
+# Compression
+django-compressor==4.4
+brotli==1.1.0
+
+# Logging
+watchtower==3.0.1  # AWS CloudWatch logs
