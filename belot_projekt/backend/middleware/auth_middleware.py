@@ -10,17 +10,27 @@ korisniku u request objekt.
 import logging
 import re
 import json
+import time
+import hashlib
+from datetime import datetime, timedelta
+
 from django.http import JsonResponse
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
 from django.conf import settings
 from django.utils.deprecation import MiddlewareMixin
+from django.utils import timezone
+from django.core.cache import cache
+
 from channels.auth import AuthMiddlewareStack
 from channels.db import database_sync_to_async
 from channels.middleware import BaseMiddleware
+
 from rest_framework.authtoken.models import Token
-from jwt import decode as jwt_decode
+from jwt import decode as jwt_decode, encode as jwt_encode
 from jwt.exceptions import InvalidTokenError, ExpiredSignatureError
+
+from utils.decorators import track_execution_time
 
 User = get_user_model()
 logger = logging.getLogger('belot.auth_middleware')
@@ -33,6 +43,12 @@ class TokenAuthMiddleware(MiddlewareMixin):
     Ovaj middleware provjerava prisutnost i valjanost tokena u zahtjevima
     upućenim API rutama. Ako je token valjan, middleware postavlja
     informaciju o autentificiranom korisniku u request objekt.
+    
+    Podržava različite vrste tokena:
+    - Token Authentication (standardni Django REST Framework token)
+    - JWT tokenima (s provjerom isteka i potpisa)
+    - Token rotacija za poboljšanje sigurnosti
+    - Blacklisting poništenih tokena
     """
     
     # Uzorci putanja za koje ovaj middleware ne provjerava token
@@ -43,15 +59,34 @@ class TokenAuthMiddleware(MiddlewareMixin):
         r'^/media/',          # Korisnički uploadani fajlovi
         r'^/$',               # Početna stranica
         r'^/favicon.ico$',    # Favicon
+        r'^/health-check/$',  # Endpoint za provjeru stanja
     ]
+    
+    # Prefiks za blacklistane tokene u cacheu
+    TOKEN_BLACKLIST_PREFIX = 'token_blacklist:'
+    
+    # Period rotacije tokena (u sekundama)
+    TOKEN_ROTATION_PERIOD = 3600 * 24  # 24 sata
     
     def __init__(self, get_response):
         """Inicijalizira middleware s funkcijom get_response."""
         self.get_response = get_response
+        
+        # Učitaj postavke iz settings.py
+        self.jwt_secret = getattr(settings, 'JWT_SECRET_KEY', settings.SECRET_KEY)
+        self.jwt_algorithm = getattr(settings, 'JWT_ALGORITHM', 'HS256')
+        self.jwt_expiration = getattr(settings, 'JWT_EXPIRATION_DELTA', 60 * 60 * 24)  # 1 dan
+        self.token_rotation = getattr(settings, 'TOKEN_ROTATION_ENABLED', True)
+        self.token_rotation_period = getattr(settings, 'TOKEN_ROTATION_PERIOD', self.TOKEN_ROTATION_PERIOD)
+        
+        # Postavke za spremanje informacija o korisničkim sesijama i IP adresama
+        self.track_session_info = getattr(settings, 'TRACK_SESSION_INFO', True)
+        self.track_suspicious_activity = getattr(settings, 'TRACK_SUSPICIOUS_ACTIVITY', True)
     
+    @track_execution_time
     def __call__(self, request):
         """
-        Obrađuje zahtjev i provjerava token ako je potrebno.
+        Obrađuje zahtjev i provjerava token.
         
         Args:
             request: HTTP zahtjev
@@ -59,64 +94,182 @@ class TokenAuthMiddleware(MiddlewareMixin):
         Returns:
             HttpResponse: Odgovor na zahtjev
         """
-        # Provjeri je li zahtjev upućen API-ju
-        if self._is_api_request(request) and not self._is_exempt_path(request.path):
-            # Provjeri token
-            auth_header = request.META.get('HTTP_AUTHORIZATION', '')
-            
-            if not auth_header:
-                logger.warning('API request without Authorization header: %s', request.path)
-                return JsonResponse({
-                    'error': 'Authorization token is required',
-                    'code': 'token_required'
-                }, status=401)
-            
-            try:
-                # Parsiranje tokena
-                token_type, token = auth_header.split(' ', 1)
-                
-                if token_type.lower() != 'token' and token_type.lower() != 'bearer':
-                    logger.warning('Invalid token type: %s', token_type)
-                    return JsonResponse({
-                        'error': 'Invalid token type',
-                        'code': 'invalid_token_type'
-                    }, status=401)
-                
-                # Provjera tokena
-                user = self._get_user_from_token(token, token_type)
-                
-                if not user:
-                    logger.warning('Invalid or expired token: %s', token[:10])
-                    return JsonResponse({
-                        'error': 'Invalid or expired token',
-                        'code': 'invalid_token'
-                    }, status=401)
-                
-                # Postavi korisnika na request
-                request.user = user
-                
-            except (ValueError, IndexError):
-                logger.warning('Malformed Authorization header: %s', auth_header)
-                return JsonResponse({
-                    'error': 'Invalid Authorization header format',
-                    'code': 'invalid_header_format'
-                }, status=401)
+        # Provjeri je li putanja izuzeta od provjere tokena
+        if self._is_exempt_path(request.path):
+            return self.get_response(request)
         
-        # Nastavi s obradom zahtjeva
+        # Provjeri je li API zahtjev
+        if not self._is_api_request(request):
+            return self.get_response(request)
+        
+        # Dohvati token iz zaglavlja
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        
+        if not auth_header:
+            # Token nije prisutan u zahtjevu - nastavi bez autentikacije
+            return self.get_response(request)
+        
+        # Raspodjeli po tipu tokena
+        if auth_header.startswith('Bearer '):
+            # JWT token
+            token = auth_header.split(' ', 1)[1].strip()
+            user, new_token = self._get_user_from_jwt(token, request)
+        elif auth_header.startswith('Token '):
+            # Token Authentication
+            token = auth_header.split(' ', 1)[1].strip()
+            user, new_token = self._get_user_from_token(token, 'token', request)
+        else:
+            # Nepoznata shema autentikacije
+            logger.warning(f"Unknown authentication scheme: {auth_header.split(' ', 1)[0]}")
+            return self.get_response(request)
+        
+        # Postavi korisnika u request objekt
+        request.user = user
+        
+        # Obradi zahtjev
         response = self.get_response(request)
+        
+        # Ako je generiran novi token zbog rotacije, dodaj ga u odgovor
+        if new_token:
+            if isinstance(new_token, dict):
+                # JWT token
+                response['X-New-Token'] = new_token['access']
+                response['X-New-Token-Expiry'] = new_token['expiry']
+            else:
+                # Token Authentication
+                response['X-New-Token'] = new_token
+        
         return response
     
-    def _is_api_request(self, request):
+    def _get_user_from_jwt(self, token, request):
         """
-        Provjerava je li zahtjev upućen API rutama.
+        Dohvaća korisnika iz JWT tokena.
         
         Args:
+            token: JWT token
             request: HTTP zahtjev
             
         Returns:
-            bool: True ako je zahtjev za API, False inače
+            tuple: (User objekt, novi token ako je potreban)
         """
-        return request.path.startswith('/api/')
+        try:
+            # Dekodiraj token
+            payload = jwt_decode(token, self.jwt_secret, algorithms=[self.jwt_algorithm])
+            user_id = payload.get('user_id')
+            
+            # Provjeri je li token na blacklisti
+            if self._is_token_blacklisted(token):
+                logger.warning(f"Blacklisted JWT token used: {self._mask_token(token)}")
+                return AnonymousUser(), None
+            
+            # Provjeri vrijeme isteka
+            exp = payload.get('exp')
+            if exp and int(time.time()) > exp:
+                # Token je istekao
+                logger.debug(f"Expired JWT token: {self._mask_token(token)}")
+                return AnonymousUser(), None
+            
+            try:
+                user = User.objects.get(pk=user_id)
+                
+                # Provjeri je li korisnički račun aktivan
+                if not user.is_active:
+                    logger.warning(f"Inactive user attempted to authenticate: {user.username}")
+                    return AnonymousUser(), None
+                
+                # Provjeri je li došlo vrijeme za rotaciju tokena
+                if self.token_rotation and self._should_rotate_token(payload):
+                    new_token = self._generate_jwt_token(user)
+                    self._blacklist_token(token)
+                    return user, new_token
+                
+                # Provjeri za sumnjive aktivnosti ako je omogućeno
+                if self.track_suspicious_activity:
+                    self._check_for_suspicious_activity(user, request, payload)
+                
+                # Spremi informacije o sesiji ako je omogućeno
+                if self.track_session_info:
+                    self._update_session_info(user, request, payload)
+                
+                return user, None
+            except User.DoesNotExist:
+                logger.warning(f"JWT token with non-existent user ID: {user_id}")
+                return AnonymousUser(), None
+                
+        except ExpiredSignatureError:
+            logger.debug(f"Expired JWT signature: {self._mask_token(token)}")
+            return AnonymousUser(), None
+        except InvalidTokenError as e:
+            logger.warning(f"Invalid JWT token: {self._mask_token(token)}, error: {str(e)}")
+            return AnonymousUser(), None
+    
+    def _get_user_from_token(self, token, token_type, request):
+        """
+        Dohvaća korisnika iz Token Authentication tokena.
+        
+        Args:
+            token: Token string
+            token_type: Tip tokena ('token')
+            request: HTTP zahtjev
+            
+        Returns:
+            tuple: (User objekt, novi token ako je potreban)
+        """
+        try:
+            # Provjeri je li token na blacklisti
+            if self._is_token_blacklisted(token):
+                logger.warning(f"Blacklisted token used: {self._mask_token(token)}")
+                return AnonymousUser(), None
+            
+            # Dohvati token iz baze
+            token_obj = Token.objects.select_related('user').get(key=token)
+            user = token_obj.user
+            
+            # Provjeri je li korisnički račun aktivan
+            if not user.is_active:
+                logger.warning(f"Inactive user attempted to authenticate: {user.username}")
+                return AnonymousUser(), None
+            
+            # Provjeri je li došlo vrijeme za rotaciju tokena
+            if self.token_rotation and self._should_rotate_drf_token(token_obj):
+                # Stvori novi token
+                # Prvo izbrišimo stari token (u transakciji)
+                old_token_key = token_obj.key
+                token_obj.delete()
+                
+                # Zatim stvorimo novi token
+                new_token = Token.objects.create(user=user)
+                
+                # Dodaj stari token na blacklistu
+                self._blacklist_token(old_token_key)
+                
+                return user, new_token.key
+            
+            # Provjeri za sumnjive aktivnosti ako je omogućeno
+            if self.track_suspicious_activity:
+                self._check_for_suspicious_activity(user, request)
+            
+            # Spremi informacije o sesiji ako je omogućeno
+            if self.track_session_info:
+                self._update_session_info(user, request)
+            
+            return user, None
+            
+        except Token.DoesNotExist:
+            logger.warning(f"Non-existent token used: {self._mask_token(token)}")
+            return AnonymousUser(), None
+    
+    def _is_api_request(self, path):
+        """
+        Provjerava je li zahtjev upućen API-ju.
+        
+        Args:
+            path: Putanja zahtjeva
+            
+        Returns:
+            bool: True ako je API zahtjev, False inače
+        """
+        return path.startswith('/api/')
     
     def _is_exempt_path(self, path):
         """
@@ -128,57 +281,261 @@ class TokenAuthMiddleware(MiddlewareMixin):
         Returns:
             bool: True ako je putanja izuzeta, False inače
         """
-        return any(re.match(pattern, path) for pattern in self.EXEMPT_PATHS)
+        for pattern in self.EXEMPT_PATHS:
+            if re.match(pattern, path):
+                return True
+        return False
     
-    def _get_user_from_token(self, token, token_type):
+    def _is_token_blacklisted(self, token):
         """
-        Dohvaća korisnika na temelju tokena.
+        Provjerava je li token na blacklisti.
         
         Args:
             token: Token za provjeru
-            token_type: Tip tokena (token ili bearer)
             
         Returns:
-            User: Korisnik ako je token valjan, None inače
+            bool: True ako je token na blacklisti, False inače
         """
-        if token_type.lower() == 'token':
-            # DRF Token autentikacija
-            try:
-                token_obj = Token.objects.select_related('user').get(key=token)
-                return token_obj.user
-            except Token.DoesNotExist:
-                return None
+        token_hash = self._hash_token(token)
+        cache_key = f"{self.TOKEN_BLACKLIST_PREFIX}{token_hash}"
+        return cache.get(cache_key) is not None
+    
+    def _blacklist_token(self, token):
+        """
+        Dodaje token na blacklistu.
         
-        elif token_type.lower() == 'bearer':
-            # JWT Token autentikacija
-            try:
-                # Dekodiraj JWT token
-                payload = jwt_decode(
-                    token, 
-                    settings.SECRET_KEY, 
-                    algorithms=['HS256']
-                )
-                
-                # Dohvati korisnika iz tokena
-                user_id = payload.get('user_id')
-                if not user_id:
-                    return None
-                
-                return User.objects.get(id=user_id)
-                
-            except (InvalidTokenError, ExpiredSignatureError, User.DoesNotExist):
-                return None
+        Args:
+            token: Token za dodavanje na blacklistu
+            
+        Returns:
+            None
+        """
+        token_hash = self._hash_token(token)
+        cache_key = f"{self.TOKEN_BLACKLIST_PREFIX}{token_hash}"
+        # Spremi na blacklistu na period koji je dulji od isteka tokena
+        cache.set(cache_key, 1, self.jwt_expiration * 2)
+    
+    def _hash_token(self, token):
+        """
+        Hashira token za sigurnije spremanje na blacklistu.
         
-        return None
+        Args:
+            token: Token za hashiranje
+            
+        Returns:
+            str: Haširan token
+        """
+        return hashlib.sha256(token.encode()).hexdigest()
+    
+    def _mask_token(self, token):
+        """
+        Maskira token za sigurnije logiranje.
+        
+        Args:
+            token: Token za maskiranje
+            
+        Returns:
+            str: Maskirani token
+        """
+        if len(token) <= 10:
+            return "***"
+        return token[:6] + "..." + token[-4:]
+    
+    def _should_rotate_token(self, payload):
+        """
+        Provjerava je li vrijeme za rotaciju JWT tokena.
+        
+        Args:
+            payload: JWT payload
+            
+        Returns:
+            bool: True ako je vrijeme za rotaciju, False inače
+        """
+        # Provjeri vrijeme stvaranja tokena
+        iat = payload.get('iat')
+        if not iat:
+            return False
+        
+        # Provjeri je li prošlo više od TOKEN_ROTATION_PERIOD sekundi
+        return int(time.time()) - iat > self.token_rotation_period
+    
+    def _should_rotate_drf_token(self, token_obj):
+        """
+        Provjerava je li vrijeme za rotaciju DRF tokena.
+        
+        Args:
+            token_obj: Token objekt
+            
+        Returns:
+            bool: True ako je vrijeme za rotaciju, False inače
+        """
+        if not hasattr(token_obj, 'created'):
+            return False
+        
+        # Izračunaj koliko je vremena prošlo od stvaranja tokena
+        time_since_creation = timezone.now() - token_obj.created
+        return time_since_creation.total_seconds() > self.token_rotation_period
+    
+    def _generate_jwt_token(self, user):
+        """
+        Generira novi JWT token za korisnika.
+        
+        Args:
+            user: User objekt
+            
+        Returns:
+            dict: Dictionary s novim tokenom i vremenom isteka
+        """
+        now = int(time.time())
+        expiry = now + self.jwt_expiration
+        
+        payload = {
+            'user_id': user.pk,
+            'username': user.username,
+            'exp': expiry,
+            'iat': now,
+            'jti': hashlib.md5(f"{now}:{user.pk}:{user.last_login if user.last_login else ''}".encode()).hexdigest()
+        }
+        
+        token = jwt_encode(payload, self.jwt_secret, algorithm=self.jwt_algorithm)
+        
+        return {
+            'access': token,
+            'expiry': datetime.fromtimestamp(expiry).isoformat()
+        }
+    
+    def _check_for_suspicious_activity(self, user, request, payload=None):
+        """
+        Provjerava ima li sumnjivih aktivnosti u korisničkoj sesiji.
+        
+        Args:
+            user: User objekt
+            request: HTTP zahtjev
+            payload: JWT payload (opcijski)
+            
+        Returns:
+            None
+        """
+        try:
+            ip_address = self._get_client_ip(request)
+            user_agent = request.META.get('HTTP_USER_AGENT', '')
+            
+            # Dohvati prethodne sesije korisnika
+            cache_key = f"user_sessions:{user.pk}"
+            sessions = cache.get(cache_key, [])
+            
+            # Provjeri za nagle promjene u IP adresi ili korisničkom agentu
+            if sessions:
+                last_session = sessions[-1]
+                if (ip_address and last_session.get('ip') and 
+                        ip_address != last_session.get('ip') and 
+                        not self._is_similar_ip(ip_address, last_session.get('ip'))):
+                    logger.warning(
+                        f"Suspicious activity: User {user.username} accessed from new IP. "
+                        f"Old: {last_session.get('ip')}, New: {ip_address}"
+                    )
+                
+                if (user_agent and last_session.get('user_agent') and 
+                        user_agent != last_session.get('user_agent')):
+                    logger.warning(
+                        f"Suspicious activity: User {user.username} accessed with new user agent. "
+                        f"Old: {last_session.get('user_agent')}, New: {user_agent}"
+                    )
+        except Exception as e:
+            logger.error(f"Error checking for suspicious activity: {str(e)}")
+    
+    def _update_session_info(self, user, request, payload=None):
+        """
+        Ažurira informacije o korisničkoj sesiji.
+        
+        Args:
+            user: User objekt
+            request: HTTP zahtjev
+            payload: JWT payload (opcijski)
+            
+        Returns:
+            None
+        """
+        try:
+            ip_address = self._get_client_ip(request)
+            user_agent = request.META.get('HTTP_USER_AGENT', '')
+            
+            # Dohvati prethodne sesije korisnika
+            cache_key = f"user_sessions:{user.pk}"
+            sessions = cache.get(cache_key, [])
+            
+            # Dodaj novu sesiju
+            new_session = {
+                'timestamp': timezone.now().isoformat(),
+                'ip': ip_address,
+                'user_agent': user_agent,
+                'path': request.path
+            }
+            
+            # Ograniči broj sesija koje čuvamo
+            sessions.append(new_session)
+            if len(sessions) > 10:
+                sessions = sessions[-10:]
+            
+            # Spremi ažurirane sesije
+            cache.set(cache_key, sessions, 60 * 60 * 24 * 7)  # 7 dana
+        except Exception as e:
+            logger.error(f"Error updating session info: {str(e)}")
+    
+    def _get_client_ip(self, request):
+        """
+        Dohvaća IP adresu klijenta iz zahtjeva.
+        
+        Args:
+            request: HTTP zahtjev
+            
+        Returns:
+            str: IP adresa
+        """
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip = x_forwarded_for.split(',')[0].strip()
+        else:
+            ip = request.META.get('REMOTE_ADDR', '127.0.0.1')
+        return ip
+    
+    def _is_similar_ip(self, ip1, ip2):
+        """
+        Provjerava jesu li dvije IP adrese slične (iz istog raspona).
+        
+        Args:
+            ip1: Prva IP adresa
+            ip2: Druga IP adresa
+            
+        Returns:
+            bool: True ako su IP adrese slične, False inače
+        """
+        try:
+            # Jednostavna provjera za IPv4 adrese
+            ip1_parts = ip1.split('.')
+            ip2_parts = ip2.split('.')
+            
+            # Ako se prva 3 dijela podudaraju, IP adrese su vjerojatno u istoj mreži
+            return ip1_parts[:3] == ip2_parts[:3]
+        except:
+            return False
 
 
 class WebSocketTokenAuthMiddleware(BaseMiddleware):
     """
     Middleware za autentikaciju WebSocket konekcija.
     
-    Ovaj middleware provjerava autentikacijski token u WebSocket
-    zahtjevima i postavlja korisnika u scope ako je token valjan.
+    Provjerava autentikacijski token u WebSocket zahtjevima
+    i dodaje informaciju o korisniku u scope.
     """
+    
+    def __init__(self, inner):
+        """Inicijalizira middleware."""
+        super().__init__(inner)
+        
+        # Učitaj postavke iz settings.py
+        self.jwt_secret = getattr(settings, 'JWT_SECRET_KEY', settings.SECRET_KEY)
+        self.jwt_algorithm = getattr(settings, 'JWT_ALGORITHM', 'HS256')
     
     async def __call__(self, scope, receive, send):
         """
@@ -186,37 +543,23 @@ class WebSocketTokenAuthMiddleware(BaseMiddleware):
         
         Args:
             scope: WebSocket scope
-            receive: Funkcija za primanje poruka
-            send: Funkcija za slanje poruka
+            receive: Async funkcija za primanje poruka
+            send: Async funkcija za slanje poruka
             
         Returns:
-            Awaitable: Rezultat obrade zahtjeva
+            None
         """
-        # Izvuci token iz query parametra ili zaglavlja
-        query_string = scope.get('query_string', b'').decode()
-        query_params = dict(item.split('=') for item in query_string.split('&') if item)
+        # Izvadi token iz query stringa
+        query_string = scope.get('query_string', b'').decode('utf-8')
+        query_params = dict(re.findall(r'([^=&]+)=([^&]*)', query_string))
         
-        token = query_params.get('token', None)
+        token = query_params.get('token')
         
-        if not token:
-            # Provjeri token u zaglavlju
-            headers = dict(scope.get('headers', []))
-            auth_header = headers.get(b'authorization', b'').decode()
-            
-            if auth_header:
-                try:
-                    token_type, token = auth_header.split(' ', 1)
-                except ValueError:
-                    token = None
-        
-        # Ako token postoji, provjeri ga
         if token:
-            user = await self._get_user_from_token(token)
-            if user:
-                scope['user'] = user
-            else:
-                scope['user'] = AnonymousUser()
+            # Dohvati korisnika iz tokena
+            scope['user'] = await self._get_user_from_token(token)
         else:
+            # Bez tokena, korisnik je anoniman
             scope['user'] = AnonymousUser()
         
         return await super().__call__(scope, receive, send)
@@ -224,50 +567,63 @@ class WebSocketTokenAuthMiddleware(BaseMiddleware):
     @database_sync_to_async
     def _get_user_from_token(self, token):
         """
-        Dohvaća korisnika na temelju tokena.
+        Dohvaća korisnika iz tokena.
         
         Args:
-            token: Token za provjeru
+            token: Token za dekodiranje
             
         Returns:
-            User: Korisnik ako je token valjan, AnonymousUser inače
+            User: Korisnički objekt ili AnonymousUser
         """
-        # Prvo provjeri kao DRF token
+        # Prvo pokušaj s JWT tokenom
         try:
-            token_obj = Token.objects.select_related('user').get(key=token)
-            return token_obj.user
-        except Token.DoesNotExist:
-            pass
-        
-        # Zatim provjeri kao JWT token
-        try:
-            # Dekodiraj JWT token
-            payload = jwt_decode(
-                token, 
-                settings.SECRET_KEY, 
-                algorithms=['HS256']
-            )
-            
-            # Dohvati korisnika iz tokena
+            payload = jwt_decode(token, self.jwt_secret, algorithms=[self.jwt_algorithm])
             user_id = payload.get('user_id')
-            if not user_id:
+            
+            # Provjeri je li token na blacklisti (implementacija bi trebala biti prilagođena)
+            # Ovdje koristimo jednostavnu implementaciju
+            cache_key = f"token_blacklist:{hashlib.sha256(token.encode()).hexdigest()}"
+            if cache.get(cache_key):
+                logger.warning(f"Blacklisted JWT token used for WebSocket: {token[:6]}...")
+                return AnonymousUser()
+                
+            # Provjeri istekao li je token
+            exp = payload.get('exp')
+            if exp and int(time.time()) > exp:
+                logger.debug(f"Expired JWT token used for WebSocket: {token[:6]}...")
                 return AnonymousUser()
             
-            return User.objects.get(id=user_id)
-            
-        except (InvalidTokenError, ExpiredSignatureError, User.DoesNotExist):
+            try:
+                return User.objects.get(pk=user_id, is_active=True)
+            except User.DoesNotExist:
+                logger.warning(f"JWT token with non-existent user ID: {user_id}")
+                return AnonymousUser()
+        
+        except (InvalidTokenError, ExpiredSignatureError) as e:
+            # Nije JWT token, pokušaj s DRF Token Authentication
+            try:
+                token_obj = Token.objects.select_related('user').get(key=token)
+                if token_obj.user.is_active:
+                    return token_obj.user
+                else:
+                    logger.warning(f"Inactive user attempted WebSocket connection: {token_obj.user.username}")
+                    return AnonymousUser()
+            except Token.DoesNotExist:
+                logger.warning(f"Invalid token used for WebSocket: {token[:6] if len(token) > 6 else token}...")
+                return AnonymousUser()
+        except Exception as e:
+            logger.error(f"Error authenticating WebSocket: {str(e)}")
             return AnonymousUser()
 
 
-# Helper za upotrebu u routing.py
 def TokenAuthMiddlewareStack(inner):
     """
-    Kreira Channels middleware stack s autentikacijom.
+    Pomoćna funkcija za dodavanje TokenAuthMiddleware u Channels middleware stack.
     
     Args:
-        inner: Middleware koji se wrappa
+        inner: Unutarnji middleware
         
     Returns:
-        MiddlewareStack: Authentication middleware stack
+        Middleware stack s dodanim TokenAuthMiddleware
     """
     return WebSocketTokenAuthMiddleware(AuthMiddlewareStack(inner))

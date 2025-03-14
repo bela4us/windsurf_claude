@@ -351,3 +351,71 @@ class Game(models.Model):
         
         # Igrači su protivnici ako su u različitim timovima
         return team1 != team2
+
+class GameHistory(models.Model):
+    """
+    Model za praćenje povijesti odigranih igara.
+    
+    Sadrži arhivirane podatke o završenim igrama, uključujući
+    konačne rezultate, vrijeme trajanja i statistiku.
+    """
+    game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name='history')
+    completed_at = models.DateTimeField(auto_now_add=True)
+    duration_seconds = models.IntegerField(default=0)
+    total_rounds = models.IntegerField(default=0)
+    team_a_score = models.IntegerField(default=0)
+    team_b_score = models.IntegerField(default=0)
+    winner_team = models.CharField(max_length=1, choices=[('a', 'Tim A'), ('b', 'Tim B')], null=True)
+    player_a1 = models.ForeignKey('users.User', on_delete=models.SET_NULL, related_name='history_team_a1', null=True)
+    player_a2 = models.ForeignKey('users.User', on_delete=models.SET_NULL, related_name='history_team_a2', null=True)
+    player_b1 = models.ForeignKey('users.User', on_delete=models.SET_NULL, related_name='history_team_b1', null=True)
+    player_b2 = models.ForeignKey('users.User', on_delete=models.SET_NULL, related_name='history_team_b2', null=True)
+    data = models.JSONField(default=dict)
+    
+    class Meta:
+        verbose_name = "Povijest igre"
+        verbose_name_plural = "Povijest igara"
+        ordering = ['-completed_at']
+        indexes = [
+            models.Index(fields=['completed_at']),
+            models.Index(fields=['winner_team']),
+        ]
+    
+    def __str__(self):
+        return f"Povijest igre {self.game.id} - {self.completed_at}"
+    
+    @classmethod
+    def create_from_game(cls, game):
+        """
+        Stvara zapis povijesti iz završene igre.
+        
+        Args:
+            game: Instanca igre koja je završena
+            
+        Returns:
+            GameHistory: Stvoreni zapis povijesti
+        """
+        history = cls(
+            game=game,
+            total_rounds=game.rounds.count(),
+            team_a_score=game.team_a_score,
+            team_b_score=game.team_b_score,
+            winner_team=game.winner_team,
+            player_a1=game.player_a1,
+            player_a2=game.player_a2,
+            player_b1=game.player_b1,
+            player_b2=game.player_b2,
+            data={
+                'rounds': [round.get_data() for round in game.rounds.all()],
+                'declarations': [decl.get_data() for decl in game.declarations.all()],
+                'moves': [move.get_data() for move in game.moves.all()],
+            }
+        )
+        
+        # Izračunaj trajanje u sekundama
+        if game.completed_at and game.created_at:
+            delta = game.completed_at - game.created_at
+            history.duration_seconds = int(delta.total_seconds())
+            
+        history.save()
+        return history

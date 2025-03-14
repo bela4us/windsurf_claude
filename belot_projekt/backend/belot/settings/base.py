@@ -27,29 +27,37 @@ DEBUG = False
 # Dozvoljeni hostovi - bit će prepisani u drugim okolinama
 ALLOWED_HOSTS = []
 
-# Definicija aplikacija
-INSTALLED_APPS = [
-    # Django Core aplikacije
+# Aplikacije definirane u ovom projektu
+LOCAL_APPS = [
+    'users.apps.UsersConfig',
+    'game.apps.GameConfig',
+    'lobby.apps.LobbyConfig',
+    'stats.apps.StatsConfig',
+]
+
+# Aplikacije trećih strana
+THIRD_PARTY_APPS = [
+    'rest_framework',
+    'rest_framework.authtoken',
+    'channels',
+    'corsheaders',
+    'drf_yasg',
+    'django_celery_beat',
+    'django_celery_results',
+]
+
+# Ugrađene Django aplikacije
+DJANGO_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    
-    # Aplikacije trećih strana
-    'channels',  # Za WebSocket podršku
-    'rest_framework',  # Za API
-    'rest_framework.authtoken',  # Za token autentikaciju
-    'corsheaders',  # Za CORS podršku
-    'django_redis',  # Za Redis keširanje
-    
-    # Vlastite aplikacije
-    'game.apps.GameConfig',  # Aplikacija za igru
-    'lobby.apps.LobbyConfig',  # Aplikacija za predvorje igre
-    'users.apps.UsersConfig',  # Aplikacija za korisnike
-    'stats.apps.StatsConfig',  # Aplikacija za statistiku
 ]
+
+# Sve instalirane aplikacije
+INSTALLED_APPS = LOCAL_APPS + THIRD_PARTY_APPS + DJANGO_APPS
 
 # Middleware
 MIDDLEWARE = [

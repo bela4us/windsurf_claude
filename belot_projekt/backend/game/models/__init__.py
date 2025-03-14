@@ -15,7 +15,7 @@ Primjer korištenja:
 """
 
 # Uvoz svih modela za lakši pristup iz drugih modula
-from game.models.game import Game
+from game.models.game import Game, GameHistory
 from game.models.round import Round
 from game.models.move import Move
 from game.models.declaration import Declaration
@@ -23,6 +23,7 @@ from game.models.declaration import Declaration
 # Definiranje koje klase čine javno API sučelje ovog paketa
 __all__ = [
     'Game',
+    'GameHistory',
     'Round',
     'Move',
     'Declaration'

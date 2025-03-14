@@ -10,10 +10,14 @@ pojedinačnih korisnika ili automatiziranih botova.
 import time
 import logging
 import hashlib
+import json
+from datetime import datetime
+
 from django.http import JsonResponse
 from django.utils.deprecation import MiddlewareMixin
 from django.conf import settings
 from django.core.cache import cache
+from django.utils.translation import gettext as _
 from utils.decorators import track_execution_time
 
 logger = logging.getLogger('belot.rate_limiter')
@@ -26,6 +30,9 @@ class RateLimiterMiddleware(MiddlewareMixin):
     Koristi Redis cache za praćenje broja zahtjeva po korisniku ili IP adresi.
     Ako korisnik prekorači dozvoljeni broj zahtjeva, middleware vraća odgovor
     s HTTP statusom 429 (Too Many Requests).
+    
+    Podržava različite limite za različite vrste zahtjeva (API/web, autenticirani/anonimni)
+    i dodaje odgovarajuća HTTP zaglavlja u skladu s najboljim praksama.
     """
     
     # Zadani parametri za ograničavanje
@@ -39,6 +46,15 @@ class RateLimiterMiddleware(MiddlewareMixin):
         r'^/static/',         # Statički fajlovi
         r'^/media/',          # Korisnički uploadani fajlovi
         r'^/favicon.ico$',    # Favicon
+        r'^/health-check/$',  # Endpoint za provjeru stanja
+    ]
+    
+    # Viši limiti za posebne endpointe (npr. prijava, registracija)
+    AUTH_ENDPOINTS = [
+        r'^/api/v\d+/auth/login/',
+        r'^/api/auth/login/',
+        r'^/api/v\d+/auth/register/',
+        r'^/api/auth/register/',
     ]
     
     def __init__(self, get_response):
@@ -53,7 +69,18 @@ class RateLimiterMiddleware(MiddlewareMixin):
         # API-specifična ograničenja (strože za API zahtjeve)
         self.api_rate_limit = getattr(settings, 'API_RATE_LIMIT_REQUESTS', self.rate_limit // 2)
         self.api_rate_window = getattr(settings, 'API_RATE_LIMIT_WINDOW', self.rate_window)
+        
+        # Posebna ograničenja za autentikacijske endpointe (strože)
+        self.auth_rate_limit = getattr(settings, 'AUTH_RATE_LIMIT_REQUESTS', 5)
+        self.auth_rate_window = getattr(settings, 'AUTH_RATE_LIMIT_WINDOW', 60)
+        
+        # Posebna ograničenja za authenticated vs anonymous korisnike
+        self.auth_user_multiplier = getattr(settings, 'AUTH_USER_LIMIT_MULTIPLIER', 3)
+        
+        # Cache expiry grace period - dodajemo ovo vrijeme da cache ne bi istekao prerano
+        self.cache_grace_period = 10
     
+    @track_execution_time
     def __call__(self, request):
         """
         Obrađuje zahtjev i provjerava ograničenja.
@@ -69,13 +96,29 @@ class RateLimiterMiddleware(MiddlewareMixin):
             return self.get_response(request)
         
         # Odaberi odgovarajuće ograničenje ovisno o tipu zahtjeva
-        is_api_request = request.path.startswith('/api/')
-        rate_limit = self.api_rate_limit if is_api_request else self.rate_limit
-        rate_window = self.api_rate_window if is_api_request else self.rate_window
+        is_api_request = self._is_api_request(request.path)
+        is_auth_endpoint = self._is_auth_endpoint(request.path)
+        is_authenticated = request.user.is_authenticated
+        
+        # Odabir odgovarajućih limita na temelju vrste zahtjeva
+        if is_auth_endpoint:
+            rate_limit = self.auth_rate_limit
+            rate_window = self.auth_rate_window
+        elif is_api_request:
+            rate_limit = self.api_rate_limit
+            rate_window = self.api_rate_window
+        else:
+            rate_limit = self.rate_limit
+            rate_window = self.rate_window
+        
+        # Povećaj limit za autenticirane korisnike (osim za auth endpointe)
+        if is_authenticated and not is_auth_endpoint:
+            rate_limit = rate_limit * self.auth_user_multiplier
         
         # Generiraj ključ za korisnika ili IP adresu
         client_key = self._get_client_key(request)
-        cache_key = f"{self.rate_key_prefix}:{client_key}"
+        endpoint_type = 'auth' if is_auth_endpoint else ('api' if is_api_request else 'web')
+        cache_key = f"{self.rate_key_prefix}:{endpoint_type}:{client_key}"
         
         # Dohvati trenutni broj zahtjeva i vremenski period
         now = int(time.time())
@@ -85,97 +128,106 @@ class RateLimiterMiddleware(MiddlewareMixin):
             # Prvi zahtjev
             request_data = {
                 'count': 1,
-                'start_time': now
+                'start_time': now,
+                'requests': [now]  # Pratimo sve zahtjeve za analizu uzoraka
             }
-            cache.set(cache_key, request_data, rate_window)
+            cache.set(cache_key, request_data, rate_window + self.cache_grace_period)
         else:
             # Provjeri je li vremenski period istekao
-            if now - request_data['start_time'] > rate_window:
+            elapsed_time = now - request_data['start_time']
+            if elapsed_time > rate_window:
                 # Ako je, resetiraj brojač
                 request_data = {
                     'count': 1,
-                    'start_time': now
+                    'start_time': now,
+                    'requests': [now]
                 }
-                cache.set(cache_key, request_data, rate_window)
+                cache.set(cache_key, request_data, rate_window + self.cache_grace_period)
             else:
-                # Inače, inkrementiraj brojač
+                # Ako nije, provjeri je li prekoračen limit
+                if request_data['count'] >= rate_limit:
+                    # Prekoračen limit - analiziraj uzorak zahtjeva za potencijalne DoS napade
+                    self._analyze_request_pattern(request_data, client_key, endpoint_type, request)
+                    
+                    # Izračunaj kada će limit biti resetiran
+                    reset_seconds = rate_window - elapsed_time
+                    reset_time = int(time.time() + reset_seconds)
+                    
+                    # Logiraj prekoračenje
+                    logger.warning(
+                        f"Rate limit exceeded: {client_key} ({request_data['count']} requests in {elapsed_time}s)"
+                    )
+                    
+                    # Vrati odgovor s informacijama o limitu
+                    return self._get_rate_limit_response(rate_limit, reset_time, reset_seconds)
+                
+                # Inače povećaj brojač i spremi vrijeme zahtjeva
                 request_data['count'] += 1
-                cache.set(cache_key, request_data, rate_window)
+                request_data['requests'].append(now)
+                
+                # Ograniči listu zahtjeva na zadnjih 100 za analizu uzoraka
+                if len(request_data['requests']) > 100:
+                    request_data['requests'] = request_data['requests'][-100:]
+                
+                cache.set(cache_key, request_data, rate_window + self.cache_grace_period)
         
-        # Provjeri je li broj zahtjeva prekoračen
-        if request_data['count'] > rate_limit:
-            # Izračunaj vrijeme do isteka ograničenja
-            reset_time = request_data['start_time'] + rate_window
-            seconds_left = max(0, reset_time - now)
-            
-            # Logiraj prekoračenje
-            logger.warning(
-                'Rate limit exceeded for %s: %d requests in %d seconds',
-                client_key, request_data['count'], now - request_data['start_time']
-            )
-            
-            # Vrati odgovor s HTTP statusom 429
-            return JsonResponse({
-                'error': 'Rate limit exceeded',
-                'code': 'rate_limit_exceeded',
-                'detail': f'You have exceeded the rate limit of {rate_limit} requests per {rate_window} seconds',
-                'retry_after': seconds_left
-            }, status=429, headers={'Retry-After': str(seconds_left)})
-        
-        # Nastavi s obradom zahtjeva
+        # Prosljeđujemo zahtjev i dodajemo informacije o limitu u odgovor
         response = self.get_response(request)
         
-        # Dodaj Rate-Limit zaglavlja u odgovor
-        if is_api_request:
-            response['X-RateLimit-Limit'] = str(rate_limit)
-            response['X-RateLimit-Remaining'] = str(max(0, rate_limit - request_data['count']))
-            response['X-RateLimit-Reset'] = str(request_data['start_time'] + rate_window)
+        # Dodaj informacije o limitu u HTTP zaglavlja
+        remaining = max(0, rate_limit - request_data['count'])
+        reset_time = request_data['start_time'] + rate_window
+        self._add_rate_limit_headers(response, rate_limit, remaining, reset_time)
         
         return response
     
     def _get_client_key(self, request):
         """
-        Generira ključ za identifikaciju klijenta.
-        
-        Prioritet:
-        1. Autentificirani korisnik
-        2. IP adresa
+        Generira jedinstveni ključ za korisnika ili IP adresu.
         
         Args:
             request: HTTP zahtjev
             
         Returns:
-            str: Ključ za identifikaciju klijenta
+            str: Jedinstveni ključ za identificiranje klijenta
         """
+        # Ako je korisnik autenticiran, koristi ID korisnika
         if request.user.is_authenticated:
             return f"user:{request.user.id}"
         
-        # Dohvati IP adresu (podržava i proxy/load balancer scenarije)
+        # Inače koristi IP adresu
         ip = self._get_client_ip(request)
-        
-        # Haširana IP adresa za bolju privatnost u logovima
-        hashed_ip = hashlib.md5(ip.encode()).hexdigest()
-        return f"ip:{hashed_ip}"
+        # Hashiranje IP adrese za privatnost
+        return f"ip:{hashlib.md5(ip.encode()).hexdigest()}"
     
     def _get_client_ip(self, request):
         """
         Dohvaća IP adresu klijenta iz zahtjeva.
         
-        Uzima u obzir proxy i load balancer scenarije.
-        
         Args:
             request: HTTP zahtjev
             
         Returns:
-            str: IP adresa klijenta
+            str: IP adresa
         """
         x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
         if x_forwarded_for:
-            # Uzmemo prvu IP adresu iz X-Forwarded-For zaglavlja
             ip = x_forwarded_for.split(',')[0].strip()
         else:
-            ip = request.META.get('REMOTE_ADDR', '0.0.0.0')
+            ip = request.META.get('REMOTE_ADDR', '127.0.0.1')
         return ip
+    
+    def _is_api_request(self, path):
+        """
+        Provjerava je li zahtjev upućen API-ju.
+        
+        Args:
+            path: Putanja zahtjeva
+            
+        Returns:
+            bool: True ako je API zahtjev, False inače
+        """
+        return path.startswith('/api/')
     
     def _is_exempt_path(self, path):
         """
@@ -188,7 +240,117 @@ class RateLimiterMiddleware(MiddlewareMixin):
             bool: True ako je putanja izuzeta, False inače
         """
         import re
-        return any(re.match(pattern, path) for pattern in self.EXEMPT_PATHS)
+        for pattern in self.EXEMPT_PATHS:
+            if re.match(pattern, path):
+                return True
+        return False
+    
+    def _is_auth_endpoint(self, path):
+        """
+        Provjerava je li putanja autentikacijski endpoint.
+        
+        Args:
+            path: Putanja zahtjeva
+            
+        Returns:
+            bool: True ako je autentikacijski endpoint, False inače
+        """
+        import re
+        for pattern in self.AUTH_ENDPOINTS:
+            if re.match(pattern, path):
+                return True
+        return False
+    
+    def _get_rate_limit_response(self, limit, reset_time, reset_seconds):
+        """
+        Stvara odgovor za prekoračeni limit.
+        
+        Args:
+            limit: Maksimalno dozvoljeni broj zahtjeva
+            reset_time: Unix timestamp kada će limit biti resetiran
+            reset_seconds: Sekunde do reseta limita
+            
+        Returns:
+            JsonResponse: Odgovor s informacijama o limitu
+        """
+        response = JsonResponse({
+            'status': 'error',
+            'code': 'rate_limit_exceeded',
+            'message': _('Prekoračen je maksimalni broj zahtjeva. Pokušajte ponovno kasnije.'),
+            'details': {
+                'limit': limit,
+                'reset': datetime.fromtimestamp(reset_time).isoformat(),
+                'reset_seconds': reset_seconds,
+            }
+        }, status=429)
+        
+        # Dodaj standardne rate-limit headere
+        self._add_rate_limit_headers(response, limit, 0, reset_time)
+        
+        # Dodaj Retry-After header (standard za 429)
+        response['Retry-After'] = str(int(reset_seconds))
+        
+        return response
+    
+    def _add_rate_limit_headers(self, response, limit, remaining, reset_time):
+        """
+        Dodaje standardne rate-limit headere u odgovor.
+        
+        Args:
+            response: HTTP odgovor
+            limit: Maksimalno dozvoljeni broj zahtjeva
+            remaining: Preostali broj zahtjeva
+            reset_time: Unix timestamp kada će limit biti resetiran
+            
+        Returns:
+            None
+        """
+        response['X-RateLimit-Limit'] = str(limit)
+        response['X-RateLimit-Remaining'] = str(remaining)
+        response['X-RateLimit-Reset'] = str(int(reset_time))
+    
+    def _analyze_request_pattern(self, request_data, client_key, endpoint_type, request):
+        """
+        Analizira uzorak zahtjeva za potencijalne DoS napade.
+        
+        Args:
+            request_data: Podaci o zahtjevima
+            client_key: Ključ klijenta
+            endpoint_type: Tip endpointa (auth, api, web)
+            request: HTTP zahtjev
+            
+        Returns:
+            None
+        """
+        # Izračunaj vremenske razmake između zahtjeva
+        if len(request_data['requests']) < 3:
+            return
+            
+        intervals = []
+        for i in range(1, len(request_data['requests'])):
+            intervals.append(request_data['requests'][i] - request_data['requests'][i-1])
+        
+        # Izračunaj standardnu devijaciju intervala
+        import statistics
+        try:
+            mean_interval = statistics.mean(intervals)
+            stdev_interval = statistics.stdev(intervals) if len(intervals) > 1 else 0
+            
+            # Ako je standardna devijacija mala, a srednji interval vrlo mali,
+            # to može ukazivati na automatiziran napad
+            if (stdev_interval < 0.1 * mean_interval and mean_interval < 1.0 and 
+                len(request_data['requests']) > 10):
+                client_ip = self._get_client_ip(request)
+                logger.warning(
+                    f"Potential DoS attack detected: {client_key} from IP {client_ip} on {endpoint_type} "
+                    f"endpoint (mean_interval={mean_interval:.3f}s, stdev={stdev_interval:.3f}s, "
+                    f"requests={len(request_data['requests'])})"
+                )
+                
+                # Mogućnost da se ovdje dodaju dodatne mjere kao što je privremeno blokiranje
+                # IP adrese putem vanjskog sustava ili duže vrijeme čekanja za ovog klijenta
+        except Exception as e:
+            logger.error(f"Error analyzing request pattern: {str(e)}")
 
 
 class APIThrottleMiddleware(MiddlewareMixin):

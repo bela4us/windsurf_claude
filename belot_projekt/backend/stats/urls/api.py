@@ -16,6 +16,8 @@ from django.utils import timezone
 from django.db.models import Count, Sum, Avg, F, Q
 from django.shortcuts import get_object_or_404
 from django.contrib.auth import get_user_model
+from rest_framework.routers import DefaultRouter
+from django.urls import path, include
 
 from ..models import (
     PlayerStats, TeamStats, GameStats, GlobalStats,
@@ -879,3 +881,14 @@ class DailyStatsViewSet(viewsets.ReadOnlyModelViewSet):
                 {"error": "Greška pri dohvaćanju dnevnih statistika"}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+# Kreiranje routera za automatsko generiranje URL-ova
+router = DefaultRouter()
+router.register(r'player-stats', PlayerStatsViewSet)
+# Dodajte registracije za ostale viewset-ove...
+
+# Definiraj URL patterns
+urlpatterns = [
+    path('', include(router.urls)),
+    # Dodajte ostale konkretne URL-ove ovdje...
+]

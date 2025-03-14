@@ -1,39 +1,29 @@
 """
-Konfiguracija Django aplikacije "users".
+Konfiguracija Django aplikacije za "users".
 
-Ovaj modul definira UsersConfig klasu koja konfigurira
-Django aplikaciju za upravljanje korisnicima Belot igre.
+Ovaj modul definira postavke aplikacije koje Django koristi
+pri registraciji i inicijalizaciji aplikacije.
 """
 
 from django.apps import AppConfig
 
 
 class UsersConfig(AppConfig):
-    """
-    Klasa za konfiguraciju Django aplikacije 'users'.
+    """Konfiguracija Django aplikacije za korisnike Belot sustava."""
     
-    Ova klasa definira osnovne postavke aplikacije i registrira
-    signale pri pokretanju.
-    """
-    
-    # Puno ime aplikacije - koristi se za identifikaciju u projektu
     name = 'users'
-    
-    # Čitljivo ime aplikacije - koristi se u admin sučelju
-    verbose_name = 'Belot Korisnici'
-    
+    verbose_name = 'Korisnici'
+    default_auto_field = 'django.db.models.BigAutoField'
+
     def ready(self):
         """
-        Metoda koja se poziva kada je aplikacija spremna.
+        Inicijalizacija aplikacije nakon što je Django spreman.
         
-        Registrira signale za korisničke događaje poput registracije,
-        prijave, odjave itd.
+        Ovdje se registriraju signali, očitavaju početni podaci,
+        i obavljaju druge inicijalizacijske radnje.
         """
-        # Uvoz signala za registraciju korisničkih događaja
+        # Uvozimo signale kako bi se automatski povezali
         try:
-            import users.signals
+            import users.signals  # noqa
         except ImportError:
-            # U slučaju da uvoz ne uspije, zabilježimo grešku bez prekida inicijalizacije
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning("Nije moguće uvesti module users.signals")
+            pass 

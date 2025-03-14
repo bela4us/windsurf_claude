@@ -4,6 +4,10 @@ Modul koji definira osnovnu klasu karte za Belot igru.
 Ovaj modul pruža implementaciju klase Card koja predstavlja jednu kartu u
 igri Belot, s metodama za rukovanje i usporedbu karata.
 """
+import logging
+from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 class Card:
     """
@@ -15,6 +19,9 @@ class Card:
     # Dozvoljene vrijednosti i boje karata
     VALID_VALUES = ['7', '8', '9', '10', 'J', 'Q', 'K', 'A']
     VALID_SUITS = ['S', 'H', 'D', 'C']
+    
+    # Redoslijed vrijednosti karata za usporedbu
+    RANKS = ['7', '8', '9', '10', 'J', 'Q', 'K', 'A']
     
     # Mapiranje kodova boja na njihova puna imena
     SUIT_NAMES = {
@@ -46,6 +53,9 @@ class Card:
         'J': 20, '9': 14, 'A': 11, '10': 10, 'K': 4, 'Q': 3, '8': 0, '7': 0
     }
     
+    # Keširanje instanci karata
+    _card_instances = {}
+    
     def __init__(self, value, suit):
         """
         Inicijalizira kartu s vrijednošću i bojom.
@@ -67,6 +77,7 @@ class Card:
         self.code = value + suit  # Npr. "AS" za asa pik
         self.rank = value  # Dodajemo atribut rank koji verificator očekuje
     
+    @lru_cache(maxsize=128)
     def get_value(self, trump_suit=None):
         """
         Vraća bodovnu vrijednost karte ovisno je li adut ili ne.
@@ -77,13 +88,19 @@ class Card:
         Returns:
             int: Bodovna vrijednost karte
         """
-        # Ako je adut definiran i karta je adut
-        if trump_suit and self.suit == self._normalize_suit(trump_suit):
-            return self.TRUMP_VALUES.get(self.value, 0)
-        else:
-            return self.NON_TRUMP_VALUES.get(self.value, 0)
+        try:
+            # Ako je adut definiran i karta je adut
+            if trump_suit and self.suit == self._normalize_suit(trump_suit):
+                return self.TRUMP_VALUES.get(self.value, 0)
+            else:
+                return self.NON_TRUMP_VALUES.get(self.value, 0)
+        except Exception as e:
+            logger.error(f"Greška pri dohvaćanju vrijednosti karte {self.code}: {e}", exc_info=True)
+            return 0
     
-    def _normalize_suit(self, suit):
+    @staticmethod
+    @lru_cache(maxsize=32)
+    def _normalize_suit(suit):
         """
         Pretvara puno ime boje u kod boje.
         
@@ -102,16 +119,16 @@ class Card:
         }
         
         # Ako je već kod, vrati ga
-        if suit in self.VALID_SUITS:
+        if suit in Card.VALID_SUITS:
             return suit
         
         # Inače pokušaj mapirati iz punog imena
-        return suit_map.get(suit.lower(), suit)
+        return suit_map.get(suit.lower() if isinstance(suit, str) else '', suit)
     
     @classmethod
     def from_code(cls, code):
         """
-        Stvara novu kartu iz koda karte.
+        Stvara novu kartu iz koda karte. Koristi keširanje za poboljšanje performansi.
         
         Args:
             code: Kod karte (npr. "AS" za asa pik)
@@ -122,18 +139,30 @@ class Card:
         Raises:
             ValueError: Ako je kod nevažeći
         """
-        if not cls.is_valid_code(code):
+        try:
+            # Provjeri je li karta već u kešu
+            if code in cls._card_instances:
+                return cls._card_instances[code]
+            
+            if not cls.is_valid_code(code):
+                raise ValueError(f"Nevažeći kod karte: {code}")
+            
+            # Posljednji znak je uvijek boja
+            suit = code[-1]
+            
+            # Sve prije posljednjeg znaka je vrijednost
+            value = code[:-1]
+            
+            # Stvori novu kartu i spremi je u keš
+            card = cls(value, suit)
+            cls._card_instances[code] = card
+            return card
+        except Exception as e:
+            logger.error(f"Greška pri stvaranju karte iz koda {code}: {e}", exc_info=True)
             raise ValueError(f"Nevažeći kod karte: {code}")
-        
-        # Posljednji znak je uvijek boja
-        suit = code[-1]
-        
-        # Sve prije posljednjeg znaka je vrijednost
-        value = code[:-1]
-        
-        return cls(value, suit)
     
     @classmethod
+    @lru_cache(maxsize=128)
     def is_valid_code(cls, code):
         """
         Provjerava je li kod karte valjan.
@@ -144,22 +173,27 @@ class Card:
         Returns:
             bool: True ako je kod valjan, False inače
         """
-        if not code or len(code) < 2:
+        try:
+            if not code or not isinstance(code, str) or len(code) < 2:
+                return False
+            
+            # Posljednji znak je boja
+            suit = code[-1]
+            if suit not in cls.VALID_SUITS:
+                return False
+            
+            # Sve prije posljednjeg znaka je vrijednost
+            value = code[:-1]
+            if value not in cls.VALID_VALUES:
+                return False
+            
+            return True
+        except Exception as e:
+            logger.error(f"Greška pri provjeri valjanosti koda karte {code}: {e}", exc_info=True)
             return False
-        
-        # Posljednji znak je boja
-        suit = code[-1]
-        if suit not in cls.VALID_SUITS:
-            return False
-        
-        # Sve prije posljednjeg znaka je vrijednost
-        value = code[:-1]
-        if value not in cls.VALID_VALUES:
-            return False
-        
-        return True
     
     @classmethod
+    @lru_cache(maxsize=8)
     def get_suit_name(cls, suit):
         """
         Vraća puno ime boje iz koda boje.
@@ -173,6 +207,7 @@ class Card:
         return cls.SUIT_NAMES.get(suit, "Unknown")
     
     @classmethod
+    @lru_cache(maxsize=16)
     def get_value_name(cls, value):
         """
         Vraća puno ime vrijednosti iz koda vrijednosti.
@@ -184,6 +219,58 @@ class Card:
             str: Puno ime vrijednosti ili "Unknown" ako vrijednost nije poznata
         """
         return cls.VALUE_NAMES.get(value, "Unknown")
+    
+    def get_rank_index(self):
+        """
+        Vraća indeks ranga karte u redoslijedu vrijednosti.
+        
+        Returns:
+            int: Indeks ranga karte (0-7)
+        """
+        try:
+            return self.RANKS.index(self.value)
+        except ValueError:
+            logger.error(f"Nevažeći rang karte: {self.value}")
+            return -1
+    
+    def get_code(self):
+        """
+        Vraća kod karte.
+        
+        Returns:
+            str: Kod karte (npr. "AS" za asa pik)
+        """
+        return self.code
+    
+    def is_trump(self, trump_suit):
+        """
+        Provjerava je li karta adut.
+        
+        Args:
+            trump_suit: Adutska boja
+            
+        Returns:
+            bool: True ako je karta adut, False inače
+        """
+        if not trump_suit:
+            return False
+            
+        normalized_trump = self._normalize_suit(trump_suit)
+        return self.suit == normalized_trump
+    
+    @classmethod
+    def create_deck(cls):
+        """
+        Stvara novi špil od 32 karte za Belot.
+        
+        Returns:
+            list: Lista od 32 karte
+        """
+        deck = []
+        for value in cls.VALID_VALUES:
+            for suit in cls.VALID_SUITS:
+                deck.append(cls(value, suit))
+        return deck
     
     def __eq__(self, other):
         """
@@ -198,7 +285,15 @@ class Card:
             bool: True ako su karte jednake, False inače
         """
         if not isinstance(other, Card):
-            return False
+            # Ako je other string, pokušaj ga pretvoriti u kartu
+            if isinstance(other, str):
+                try:
+                    other = Card.from_code(other)
+                except ValueError:
+                    return False
+            else:
+                return False
+                
         return self.value == other.value and self.suit == other.suit
     
     def __lt__(self, other):
@@ -217,8 +312,7 @@ class Card:
             return NotImplemented
         
         # Podrazumijevamo ne-adutsku usporedbu (za jednostavnost)
-        value_order = {'7': 0, '8': 1, '9': 2, 'J': 3, 'Q': 4, 'K': 5, '10': 6, 'A': 7}
-        return value_order.get(self.value, 0) < value_order.get(other.value, 0)
+        return self.get_rank_index() < other.get_rank_index()
     
     def __gt__(self, other):
         """
@@ -236,8 +330,7 @@ class Card:
             return NotImplemented
         
         # Podrazumijevamo ne-adutsku usporedbu (za jednostavnost)
-        value_order = {'7': 0, '8': 1, '9': 2, 'J': 3, 'Q': 4, 'K': 5, '10': 6, 'A': 7}
-        return value_order.get(self.value, 0) > value_order.get(other.value, 0)
+        return self.get_rank_index() > other.get_rank_index()
     
     def __hash__(self):
         """
@@ -261,7 +354,7 @@ class Card:
     
     def __repr__(self):
         """
-        Vraća reprezentaciju karte za debagiranje.
+        Vraća reprezentaciju karte za programere.
         
         Returns:
             str: String u formatu "Card('vrijednost', 'boja')"
